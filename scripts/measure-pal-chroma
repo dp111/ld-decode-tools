@@ -1,0 +1,193 @@
+#!/usr/bin/python3
+#
+# measure-pal-chroma - quantitative quality benchmark for the PAL chroma decoders
+# Copyright (C) 2026 ld-decode contributors
+#
+# This file is part of ld-decode-tools.
+#
+# measure-pal-chroma is free software: you can redistribute it and/or
+# modify it under the terms of the GNU General Public License as
+# published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+"""Self-contained PAL chroma-decoder quality benchmark.
+
+Unlike scripts/test-chroma (which is a pass/fail regression test driven by
+ffmpeg), this tool reports *comparable numbers* for evaluating decoder changes:
+
+  - a synthetic ground-truth image is generated, encoded to a TBC with
+    ld-chroma-encoder, optionally corrupted with Gaussian noise, then decoded
+    with ld-chroma-decoder and compared back to the original;
+  - reconstruction PSNR (RGB / Y / U / V) measures overall fidelity;
+  - a greyscale torture pattern additionally measures cross-colour (any chroma
+    in the decode of a greyscale source is luma->chroma leakage; lower = better).
+
+It needs only numpy (no ffmpeg). Geometry is handled automatically by searching
+for the best horizontal alignment between the encoder input and decoder output.
+
+Examples:
+  scripts/measure-pal-chroma --build-dir build
+  scripts/measure-pal-chroma --build-dir build --decoders transform2d transform3d
+  scripts/measure-pal-chroma --build-dir build --noise 376 750 1190
+"""
+
+import argparse
+import os
+import subprocess
+import sys
+import tempfile
+
+import numpy as np
+
+# PAL active-image geometry produced by ld-chroma-encoder (palencoder.cpp).
+W, H = 928, 576
+
+
+def yuv(im):
+    r, g, b = im[..., 0], im[..., 1], im[..., 2]
+    y = 0.299 * r + 0.587 * g + 0.114 * b
+    return y, 0.492 * (b - y), 0.877 * (r - y)
+
+
+def psnr(a, b):
+    mse = np.mean((a - b) ** 2)
+    return 99.0 if mse < 1e-9 else 10 * np.log10((65535.0 ** 2) / mse)
+
+
+def make_colourbars():
+    """Wide, bandwidth-friendly colour bars: tests chroma fidelity."""
+    img = np.zeros((H, W, 3), np.uint16)
+    bars = [(180, 180, 180), (180, 180, 0), (0, 180, 180), (0, 180, 0),
+            (180, 0, 180), (180, 0, 0), (0, 0, 180), (40, 40, 40)]
+    for i, c in enumerate(bars):
+        img[:, i * W // 8:(i + 1) * W // 8] = np.array(c, np.float64) * 257
+    return img
+
+
+def make_greyscale():
+    """Greyscale horizontal frequency sweeps: tests cross-colour (Y->C leak)."""
+    img = np.zeros((H, W, 3), np.uint16)
+    xs = np.arange(W)
+    for band, (lo, hi) in enumerate([(0.05, 0.30), (0.30, 0.50), (0.10, 0.45)]):
+        y0, y1 = band * H // 3, (band + 1) * H // 3
+        f = lo + (hi - lo) * (xs / W)
+        v = 0.5 + 0.4 * np.sin(2 * np.pi * np.cumsum(f))
+        g = (v * 65535).astype(np.uint16)
+        img[y0:y1, :, 0] = g
+        img[y0:y1, :, 1] = g
+        img[y0:y1, :, 2] = g
+    return img
+
+
+def add_noise(in_tbc, out_tbc, sigma, seed=12345):
+    a = np.fromfile(in_tbc, np.uint16).astype(np.float64)
+    a += np.random.default_rng(seed).normal(0, sigma, a.shape)
+    np.clip(a, 0, 65535, out=a)
+    a.astype(np.uint16).tofile(out_tbc)
+
+
+def best_offset(orig, dec):
+    best = (0, 1e18)
+    for off in range(-8, 9):
+        a = orig[:, 60:868]
+        b = np.roll(dec, off, axis=1)[:, 60:868]
+        m = np.mean((a - b) ** 2)
+        if m < best[1]:
+            best = (off, m)
+    return best[0]
+
+
+def encode(enc_bin, img, tbcdir, name):
+    rgb = os.path.join(tbcdir, name + ".rgb")
+    tbc = os.path.join(tbcdir, name + ".tbc")
+    with open(rgb, "wb") as f:
+        for _ in range(4):  # 4 frames so transform3d has temporal neighbours
+            img.tofile(f)
+    subprocess.run([enc_bin, "-q", "-f", "PAL", "-p", "rgb", rgb, tbc], check=True)
+    return tbc
+
+
+def decode(dec_bin, tbc, decoder, threshold, out):
+    subprocess.run([dec_bin, "-q", "--input-metadata", tbc + ".db",
+                    "-f", decoder, "--transform-threshold", str(threshold),
+                    "-p", "rgb", "-s", "1", "-l", "1", tbc, out], check=True)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--build-dir", default="build", help="CMake build directory")
+    ap.add_argument("--decoders", nargs="+",
+                    default=["pal2d", "transform2d", "transform3d"])
+    ap.add_argument("--threshold", type=float, default=0.4,
+                    help="Transform PAL threshold")
+    ap.add_argument("--noise", type=float, nargs="*", default=[0.0],
+                    help="Gaussian noise sigma(s) in 16-bit LSB (100 IRE = 37632)")
+    args = ap.parse_args()
+
+    enc = os.path.join(args.build_dir, "bin", "ld-chroma-encoder")
+    dec = os.path.join(args.build_dir, "bin", "ld-chroma-decoder")
+    for tool in (enc, dec):
+        if not os.path.exists(tool):
+            sys.exit("Not found: %s (build first, or pass --build-dir)" % tool)
+
+    bars = make_colourbars()
+    grey = make_greyscale()
+    margin = (40, 8)  # (x, y) crop to avoid filter edge effects
+
+    with tempfile.TemporaryDirectory() as td:
+        bars_tbc = encode(enc, bars, td, "bars")
+        grey_tbc = encode(enc, grey, td, "grey")
+
+        for sigma in args.noise:
+            if sigma > 0:
+                bt = os.path.join(td, "bars_n.tbc")
+                gt = os.path.join(td, "grey_n.tbc")
+                add_noise(bars_tbc, bt, sigma)
+                add_noise(grey_tbc, gt, sigma)
+                # noise.py only rewrites the .tbc; reuse the original .db
+                for src, dst in ((bars_tbc, bt), (grey_tbc, gt)):
+                    if not os.path.exists(dst + ".db"):
+                        os.symlink(os.path.abspath(src + ".db"), dst + ".db")
+            else:
+                bt, gt = bars_tbc, grey_tbc
+
+            print("\n=== noise sigma = %g (%.0f dB vs 100 IRE) ==="
+                  % (sigma, 99 if sigma == 0 else 20 * np.log10(37632.0 / sigma)))
+            print("%-13s %8s %8s %8s %8s | %12s %8s"
+                  % ("decoder", "barRGB", "barY", "barU", "barV",
+                     "greyXcolor", "greyY"))
+
+            mx, my = margin
+            bc = bars[my:H - my, mx:W - mx]
+            bcy, bcu, bcv = yuv(bc)
+            gc = grey[my:H - my, mx:W - mx]
+            gcy, _, _ = yuv(gc)
+
+            for d in args.decoders:
+                bo = os.path.join(td, "b_%s.rgb" % d)
+                go = os.path.join(td, "g_%s.rgb" % d)
+                decode(dec, bt, d, args.threshold, bo)
+                decode(dec, gt, d, args.threshold, go)
+                bd = np.fromfile(bo, np.uint16).reshape(H, W, 3).astype(np.float64)
+                gd = np.fromfile(go, np.uint16).reshape(H, W, 3).astype(np.float64)
+                bd = np.roll(bd, best_offset(bars, bd), axis=1)[my:H - my, mx:W - mx]
+                gd = np.roll(gd, best_offset(grey, gd), axis=1)[my:H - my, mx:W - mx]
+                bdy, bdu, bdv = yuv(bd)
+                _, gdu, gdv = yuv(gd)
+                xcolor = 0.5 * (np.abs(gdu).mean() + np.abs(gdv).mean())
+                print("%-13s %8.2f %8.2f %8.2f %8.2f | %12.1f %8.2f"
+                      % (d, psnr(bc, bd), psnr(bcy, bdy), psnr(bcu, bdu),
+                         psnr(bcv, bdv), xcolor, psnr(gcy, yuv(gd)[0])))
+
+
+if __name__ == "__main__":
+    main()

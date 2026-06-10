@@ -7,6 +7,15 @@ That handoff covered RF-side work in ld-decode and listed open items to check
 on the chroma-decoder side; this document records the result of working
 through them.
 
+A second pass added an **empirical** investigation ("is there a better
+decoder?") backed by a reproducible measurement harness; see "Empirical
+validation" below. The headline conclusion is that the existing PAL decoders
+are already well-tuned: the defaults that looked improvable on noise-free
+synthetic data do not survive a realistic-noise test, and the one in-code
+"this looks wrong" note (`transformpal3d` `z_ref`) is actually correct. The
+concrete code changes are two correctness items (the `in5` guard below and the
+misleading `z_ref` comment) plus the new benchmark script.
+
 ## Bug found and fixed
 
 ### `palcolour.cpp`: `in5` vertical-tap boundary guard off by one
@@ -78,10 +87,10 @@ not a regression introduced on this branch.
   half-tile overlap and a symmetric raised-cosine window so inverse tiles sum
   without an inverse window; 3D extends this in Z with documented
   look-behind/look-ahead. X-bin range (`XTILE/8 … XTILE/4`, 0.5–1.5 fSC) matches
-  the ±1.3 MHz chroma band. The `z_ref` reflection carries an in-code `XXX`
-  note questioning `ZTILE/4`, but it is consistent with the documented 18.75 Hz
-  axis and reflection target; left as-is (pre-existing, out of scope for this
-  audit).
+  the ±1.3 MHz chroma band. The `z_ref` temporal reflection carried an in-code
+  `XXX` note suggesting `ZTILE/4` was wrong; it is in fact correct (verified
+  empirically — see "Empirical validation"), and the misleading comment has
+  been rewritten.
 
 ## Not addressed (belong to other work)
 
@@ -89,3 +98,97 @@ The remaining handoff open items — MTF over-equalisation (~+1.5 dB at 4.8 MHz)
 fold-over distortion, and the multi-disc MTF calibration campaign — are
 ld-decode RF-side items requiring a calibration dataset, not chroma-decoder
 code changes.
+
+## Empirical validation ("can we do better?")
+
+To answer this with numbers rather than opinion, a self-contained benchmark was
+added: `scripts/measure-pal-chroma`. It generates a synthetic ground-truth
+image, encodes it to a TBC with `ld-chroma-encoder`, optionally adds Gaussian
+noise, decodes it with `ld-chroma-decoder`, and compares the result to the
+original. Two patterns are used:
+
+- **Wide colour bars** (bandwidth-friendly) — reconstruction PSNR measures
+  chroma/luma fidelity.
+- **Greyscale frequency sweeps** — since the source has no chroma, any U/V in
+  the decode is luma->chroma cross-colour; mean |UV| (lower = better) and the
+  luma PSNR measure Y/C separation.
+
+The same encode/decode path was also confirmed to run on the real PAL captures
+in `test-data/pal/` (the GGV multiburst and the Kagemusha colour-bar leadout
+referenced by the handoff).
+
+### Decoder baseline (noise-free; numbers in dB unless noted)
+
+```
+decoder        barRGB    barY    barU    barV | greyXcolor(|UV|)  greyY
+pal2d           27.74   37.48   31.27   30.58 |          384.2   20.02
+transform2d     28.20   47.40   31.31   30.68 |           29.5   41.47
+transform3d     28.23   49.63   31.33   30.68 |           20.7   44.93
+```
+
+This matches expectations: Transform PAL separates luma far better than the
+PALcolour 2D FIR (47-50 dB vs 37 dB barY; 20-30 vs 384 cross-colour), and 3D
+beats 2D on static content. Chroma fidelity (barU/barV) is similar across all
+three — the decoders differ mainly in luma / cross-colour, not in chroma.
+
+### Transform threshold (default 0.4) — confirmed well-chosen
+
+On noise-free data, *raising* the threshold (stricter symmetry test, keeps
+fewer bins) reduced cross-colour and improved greyscale luma with no colour
+loss, which naively suggests the default is too low. But the threshold's real
+job is noise rejection, so it was re-swept with injected RF noise:
+
+```
+transform2d, greyscale luma PSNR (dB) vs threshold
+ noise     0.3    0.4    0.5    0.6    0.7
+ 40 dB   37.23  38.68  38.96  39.19  39.59
+ 34 dB   34.48  34.97  34.90  34.76  34.64
+ 30 dB   31.56  31.66  31.45  31.18  30.90
+```
+
+At realistic LaserDisc SNRs (30-34 dB) luma PSNR peaks at ~0.4 and colour-bar
+fidelity degrades monotonically as the threshold rises. The noise-free gain was
+a mirage. **Default 0.4 stands.**
+
+### PALcolour chroma bandwidth (`1.1 MHz / 0.93`) — Pareto, not a bug
+
+Sweeping the bandwidth constant trades cross-colour against chroma sharpness
+with no free lunch: narrower (~1.05 MHz) lowers cross-colour and lifts luma but
+softens saturated colour; wider does the reverse. The shipped ~1.18 MHz sits in
+a sensible spot favouring colour fidelity. Picking a different point is an
+aesthetic/real-disc-calibration decision (the handoff's deferred campaign), not
+a correctness fix, so the value is left unchanged.
+
+### `transformpal3d` `z_ref` reflection axis — code is correct, comment fixed
+
+An in-code `XXX` claimed the temporal reflection should be about 18.75 Hz
+(`(6*ZTILE)/8`) rather than the shipped 6.25 Hz (`ZTILE/4`). Testing all three
+candidate centres on a static loopback:
+
+```
+z_ref reflection centre            barY/greyY luma PSNR
+ 6.25 Hz  (ZTILE/4,   shipped)        ~37-49 dB   <-- best by far
+12.5 Hz  (ZTILE/2)                    ~15-16 dB
+18.75 Hz ((6*ZTILE)/8, "suggested")  ~12-13 dB
+```
+
+The shipped value wins by ~24 dB. The reason is physical: a static PAL picture
+repeats over the 8-field sequence, so its chroma temporal carrier is at the
+field rate / 8 = 6.25 Hz = bin `ZTILE/8`, and the reflection constant is twice
+that, `ZTILE/4`. The `18.75 Hz` in the comment was a misidentification (it is
+the 3rd harmonic). The misleading comment has been corrected so the working
+code is not "fixed" into a 24 dB regression later.
+
+### `in5` guard fix — verified scope
+
+The `palcolour.cpp` fix above was confirmed with the harness to change exactly
+two lines per frame (the 3rd active line of each field, lines 4 and 5), as
+predicted, with no effect elsewhere.
+
+### Reproducing
+
+```
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release && ninja -C build \
+    ld-chroma-decoder ld-chroma-encoder
+scripts/measure-pal-chroma --build-dir build --noise 0 376 750 1190
+```

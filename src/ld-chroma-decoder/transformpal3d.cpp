@@ -254,13 +254,18 @@ void TransformPal3D::applyFilter()
     // every bin that might be a chroma signal, and only keep it if it's
     // sufficiently symmetrical with its reflection.
     //
-    // The Z axis covers 0 to 50 Hz;      18.75 Hz is 3/8 * ZTILE.
+    // The Z axis covers 0 to 50 Hz;      6.25 Hz is 1/8 * ZTILE.
     // The Y axis covers 0 to 576 c/aph;  72 c/aph is 1/8 * YTILE.
     // The X axis covers 0 to 4fSC Hz;    fSC HZ   is 1/4 * XTILE.
 
     for (qint32 z = 0; z < ZTILE; z++) {
-        // Reflect around 18.75 Hz temporally.
-        // XXX Why ZTILE / 4? It should be (6 * ZTILE) / 8...
+        // Reflect around 6.25 Hz temporally: for a static picture the PAL
+        // chroma pattern repeats over the 8-field sequence, so its temporal
+        // carrier is at the field rate / 8 = 50/8 = 6.25 Hz, i.e. bin
+        // ZTILE/8. The reflection constant is twice that, ZTILE/4. (An
+        // earlier note here suggested 18.75 Hz / (6*ZTILE)/8; that is wrong --
+        // verified empirically, reflecting about 18.75 Hz costs ~24 dB of
+        // luma PSNR on a static encode/decode loopback.)
         const qint32 z_ref = ((ZTILE / 4) + ZTILE - z) % ZTILE;
 
         for (qint32 y = 0; y < YTILE; y++) {
