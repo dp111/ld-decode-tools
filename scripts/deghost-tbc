@@ -1,0 +1,236 @@
+#!/usr/bin/python3
+#
+# deghost-tbc - adaptive ghost/echo canceller for composite TBC files
+# Copyright (C) 2026 ld-decode contributors
+#
+# This file is part of ld-decode-tools.
+#
+# deghost-tbc is free software: you can redistribute it and/or modify it under
+# the terms of the GNU General Public License as published by the Free Software
+# Foundation, either version 3 of the License, or (at your option) any later
+# version.
+#
+# This program is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+# FOR A PARTICULAR PURPOSE.  See the GNU General Public License for more
+# details.
+#
+# You should have received a copy of the GNU General Public License along with
+# this program.  If not, see <http://www.gnu.org/licenses/>.
+
+"""Adaptively detect and remove a horizontal ghost (echo) from a TBC.
+
+A "ghost to the right" of sharp transitions is a delayed, scaled copy of the
+signal -- a single-bounce reflection somewhere in the player/RF/capture chain:
+
+    composite[x] = clean[x] + a * clean[x - d]        (0 < a < 1, d > 0 samples)
+
+This is a *composite-domain* distortion (it sits in the TBC, upstream of
+ld-chroma-decoder -- a clean encode/decode loopback shows no such ghost), so it
+is cancelled here on the composite signal, which removes it from luma *and*
+chroma at once. The exact inverse is the recursive filter
+
+    clean[x] = composite[x] - a * clean[x - d]
+
+The echo parameters (d, a) are estimated blindly:
+  * the delay d is found from the dominant side-peak of the autocorrelation of
+    the horizontal gradient of the *decoded luma* (decoding first removes the
+    colour subcarrier, so the estimate is not fooled by chroma on saturated
+    colour);
+  * the amplitude a is found by a 1-D search that nulls the residual echo.
+
+If no significant echo is detected the input is passed through unchanged.
+
+Usage (reliable):    pass the ghost offset you can read off the picture; the
+                     amplitude is auto-fitted:
+    scripts/deghost-tbc --build-dir build --delay 20 in.tbc out.tbc
+    scripts/deghost-tbc --build-dir build --delay 20 --amplitude 0.15 in.tbc out.tbc
+
+Usage (experimental): let it estimate the delay (verify the reported value):
+    scripts/deghost-tbc --build-dir build --auto in.tbc out.tbc
+
+The output is a new TBC (its .db is copied), which you then decode as usual with
+ld-chroma-decoder.
+"""
+
+import argparse
+import os
+import shutil
+import sqlite3
+import subprocess
+import sys
+import tempfile
+
+import numpy as np
+
+
+def read_geometry(db):
+    c = sqlite3.connect(db)
+    r = c.execute("select active_video_start, active_video_end, field_width, "
+                  "field_height from capture limit 1").fetchone()
+    c.close()
+    return dict(avs=r[0], ave=r[1], fw=r[2], fh=r[3])
+
+
+def read_tbc(path, geo):
+    a = np.fromfile(path, np.uint16)
+    n = a.size // (geo["fw"] * geo["fh"])
+    return a[:n * geo["fw"] * geo["fh"]].reshape(n, geo["fh"], geo["fw"]).astype(np.float64)
+
+
+def write_tbc(arr, path):
+    np.clip(arr, 0, 65535).astype(np.uint16).tofile(path)
+
+
+def decode_luma(decoder, tbc, db, geo, frames=2):
+    """Decode a few frames to RGB and return per-row luma of the active area."""
+    with tempfile.NamedTemporaryFile(suffix=".rgb", delete=False) as tf:
+        out = tf.name
+    try:
+        subprocess.run([decoder, "-q", "--input-metadata", db, "-f", "transform2d",
+                        "-p", "rgb", "-s", "1", "-l", str(frames), tbc, out], check=True)
+        w = _decoded_width(out, frames)
+        a = np.fromfile(out, np.uint16).reshape(-1, w, 3).astype(np.float64)
+        return 0.299 * a[..., 0] + 0.587 * a[..., 1] + 0.114 * a[..., 2]
+    finally:
+        os.unlink(out)
+
+
+def _decoded_width(path, frames):
+    n = os.path.getsize(path) // 2
+    # n = frames * height * width * 3 ; height ~ 576 (PAL) or 486 (NTSC), width unknown
+    for h in (576, 486, 480):
+        if (n // (frames * 3)) % h == 0:
+            return (n // (frames * 3)) // h
+    raise RuntimeError("cannot infer decoded width")
+
+
+def composite_luma_rows(arr, geo):
+    """Luma-band of the active composite (length-8 boxcar nulls the 0.5-1.5 fSC
+    chroma band), as a 2-D array of rows. Used for the amplitude fit, which
+    must measure the echo on the *composite* we are about to cancel -- not on
+    decoded luma, whose edge-ringing would bias the fit."""
+    act = arr[:, :, geo["avs"]:geo["ave"]]
+    k = np.ones(8) / 8
+    luma = np.apply_along_axis(lambda r: np.convolve(r, k, "same"), 2, act)
+    return luma.reshape(-1, luma.shape[-1])
+
+
+def _gradient_rows(luma):
+    g = np.diff(luma, axis=-1)
+    g = g - g.mean(axis=-1, keepdims=True)
+    return g.reshape(-1, g.shape[-1])
+
+
+def _acf(g, tau):
+    return float(np.sum(g[:, tau:] * g[:, :-tau]))
+
+
+def estimate_delay(luma, dmin, dmax):
+    g = _gradient_rows(luma)
+    r0 = float(np.sum(g * g))
+    ratios = np.array([_acf(g, t) / r0 for t in range(dmin, dmax + 1)])
+    order = np.argsort(ratios)[::-1]
+    cands = [(dmin + int(i), float(ratios[i])) for i in order[:4] if ratios[i] > 0]
+    return cands
+
+
+def fit_amplitude(luma, d, amax=0.45, iters=24):
+    """1-D search for a that nulls the residual echo at lag d (on luma)."""
+    def cancel(a):
+        out = luma.copy()
+        for n in range(d, out.shape[-1]):
+            out[..., n] = luma[..., n] - a * out[..., n - d]
+        return out
+
+    def resid(a):
+        g = _gradient_rows(cancel(a))
+        return abs(_acf(g, d)) / float(np.sum(g * g))
+
+    lo, hi = 0.0, amax
+    for _ in range(iters):
+        m1, m2 = lo + (hi - lo) / 3, hi - (hi - lo) / 3
+        if resid(m1) < resid(m2):
+            hi = m2
+        else:
+            lo = m1
+    a = 0.5 * (lo + hi)
+    return a, resid(a)
+
+
+def cancel_composite(arr, a, d):
+    out = arr.copy()
+    for n in range(d, out.shape[-1]):
+        out[..., n] = arr[..., n] - a * out[..., n - d]
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("input", help="input .tbc")
+    ap.add_argument("output", help="output .tbc (its .db is copied from the input)")
+    ap.add_argument("--build-dir", default="build", help="CMake build dir (for ld-chroma-decoder)")
+    ap.add_argument("--input-metadata", help="input .db (default: <input>.db)")
+    ap.add_argument("--delay", type=int,
+                    help="echo delay in samples (read this off the visible ghost: "
+                         "the offset, in 4fSC samples, from an edge to its replica). "
+                         "Recommended -- this is the reliable mode.")
+    ap.add_argument("--amplitude", type=float,
+                    help="echo amplitude 0..1 (default: auto-fit at the given delay)")
+    ap.add_argument("--auto", action="store_true",
+                    help="EXPERIMENTAL: estimate the delay blindly instead of "
+                         "passing --delay. Reliable on natural content / isolated "
+                         "edges, but can lock onto regular periodic structure "
+                         "(e.g. colour-bar ringing); always sanity-check the "
+                         "reported delay against the visible ghost offset.")
+    ap.add_argument("--dmin", type=int, default=6, help="min delay to search, --auto (samples)")
+    ap.add_argument("--dmax", type=int, default=90, help="max delay to search, --auto (samples)")
+    args = ap.parse_args()
+
+    if args.delay is None and not args.auto:
+        sys.exit("Specify --delay N (the ghost offset in samples; recommended) or "
+                 "--auto for experimental blind estimation. See --help.")
+
+    db = args.input_metadata or (args.input + ".db")
+    decoder = os.path.join(args.build_dir, "bin", "ld-chroma-decoder")
+    geo = read_geometry(db)
+    arr = read_tbc(args.input, geo)
+
+    # Amplitude is fitted on the composite luma-band (what we actually cancel).
+    # Blind delay detection (--auto) uses decoded luma, where the colour
+    # subcarrier is gone so the delay search is not fooled by chroma.
+    comp_rows = composite_luma_rows(arr, geo)
+
+    if args.delay is not None:
+        d = args.delay
+    else:
+        if not os.path.exists(decoder):
+            sys.exit("ld-chroma-decoder not found at %s (pass --build-dir)" % decoder)
+        dec = decode_luma(decoder, args.input, db, geo)
+        dec = dec[dec.shape[0] // 8: -dec.shape[0] // 8, 40:-40]
+        cands = estimate_delay(dec, args.dmin, args.dmax)
+        best = None
+        for cd, cr in cands[:3]:
+            _, cres = fit_amplitude(comp_rows, cd)
+            gain = cr - cres
+            if best is None or gain > best[0]:
+                best = (gain, cd, cr)
+        d = best[1]
+        print("Blind estimate: delay d=%d samples (side-peak ratio %.3f). "
+              "VERIFY this matches the visible ghost offset." % (d, best[2]))
+
+    if args.amplitude is not None:
+        a = args.amplitude
+    else:
+        a, res = fit_amplitude(comp_rows, d)
+        print("Fitted echo amplitude a=%.3f at delay d=%d (residual side-peak %.3f)"
+              % (a, d, res))
+
+    write_tbc(cancel_composite(arr, a, d), args.output)
+    shutil.copyfile(db, args.output + ".db")
+    print("Wrote deghosted TBC: %s (cancelled echo a=%.3f, d=%d)" % (args.output, a, d))
+
+
+if __name__ == "__main__":
+    main()

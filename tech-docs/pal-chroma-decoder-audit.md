@@ -192,3 +192,49 @@ cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release && ninja -C build \
     ld-chroma-decoder ld-chroma-encoder
 scripts/measure-pal-chroma --build-dir build --noise 0 376 750 1190
 ```
+
+## Rightward "ghost" on sharp transitions — diagnosis and an adaptive canceller
+
+Symptom: a displaced replica to the right of high-contrast (especially
+black<->white) transitions.
+
+**It is not the chroma decoder.** A clean encode->decode loopback reproduces a
+sharp black/white edge with no displaced replica (transform2d/3d are essentially
+perfect; PALcolour shows only small symmetric edge ripple). The decoder's FIR /
+FFT filters are horizontally symmetric, so they cannot produce a one-sided
+right-hand echo. A rightward echo is therefore a *composite-domain* linear
+distortion already present in the TBC — a single-bounce reflection in the
+player / RF / capture chain:
+
+    composite[x] = clean[x] + a * clean[x - d]      (0 < a < 1, d > 0 samples)
+
+Because it is upstream of and independent of colour decoding, it is best removed
+on the composite signal (which fixes luma *and* chroma together) by the exact
+inverse recursive filter:
+
+    clean[x] = composite[x] - a * clean[x - d]
+
+`scripts/deghost-tbc` implements this as a TBC->TBC pre-decode filter:
+
+- **Cancellation core is exact.** Injecting a known echo into a synthetic TBC
+  and cancelling with the true (a, d) restores the decoded PSNR to the
+  echo-free baseline to within 0.01 dB (e.g. colour bars 28.20 -> 17.20 with a
+  0.15/20 echo -> 28.20 after cancel).
+- **Amplitude is auto-fitted** at a given delay by a 1-D search that nulls the
+  residual echo, measured on the composite luma band (an 8-tap boxcar nulls the
+  0.5-1.5 fSC chroma band). On pure-luma content this is accurate (a 0.20/15
+  edge echo: fitted 0.188, decoded 23.1 -> 48.8 dB; a greyscale 0.12/22 echo:
+  18.8 -> 31.8 dB). On fully-saturated colour bars, where every luma edge
+  coincides with a chroma edge, it under-corrects (~0.5x) but still improves;
+  pass `--amplitude` to override.
+- **Delay** is supplied by the user (`--delay N`, the ghost offset in 4fSC
+  samples, which is directly readable from the picture) — the reliable mode.
+  `--auto` adds experimental blind delay estimation from the autocorrelation of
+  the decoded-luma gradient (decoding first removes chroma). This is reliable on
+  natural content / isolated edges but can lock onto regular periodic structure
+  (e.g. coherent colour-bar edge-ringing), so the reported delay should always
+  be checked against the visible ghost offset.
+
+Caveat: the model is a single first-order echo at integer-sample delay. Multiple
+or fractional-delay ghosts would need a short adaptive FIR equaliser; the same
+residual-nulling framework extends to that.
